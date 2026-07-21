@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x86_64
+            runner: macos-13
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build release assets
+        env:
+          CODEX_BUILD_ARCH: ${{ matrix.arch }}
+          CODEX_VERSION: ${{ github.ref_name }}
+        run: ./build_github_release.sh
+
+      - name: Upload build assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-usage-${{ matrix.arch }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/SHA256SUMS-${{ matrix.arch }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: macos-13
+    steps:
+      - name: Download build assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: codex-usage-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            release-assets/*.dmg \
+            release-assets/*.zip \
+            release-assets/SHA256SUMS-* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
