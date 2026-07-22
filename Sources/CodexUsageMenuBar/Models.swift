@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 enum ProviderKind: String, CaseIterable, Identifiable, Codable {
     case sub2api
@@ -22,6 +23,35 @@ enum ProviderKind: String, CaseIterable, Identifiable, Codable {
         case .officialCodex: return "本机 Codex / 配额窗口"
         }
     }
+
+    var capabilities: ProviderCapabilities {
+        switch self {
+        case .sub2api, .newAPI:
+            return ProviderCapabilities(
+                supportsModels: true,
+                supportsBalance: true,
+                supportsRateMetrics: true,
+                supportsLatency: true,
+                supportsQuotaWindows: false
+            )
+        case .officialCodex:
+            return ProviderCapabilities(
+                supportsModels: false,
+                supportsBalance: true,
+                supportsRateMetrics: false,
+                supportsLatency: false,
+                supportsQuotaWindows: true
+            )
+        }
+    }
+}
+
+struct ProviderCapabilities: Equatable {
+    let supportsModels: Bool
+    let supportsBalance: Bool
+    let supportsRateMetrics: Bool
+    let supportsLatency: Bool
+    let supportsQuotaWindows: Bool
 }
 
 enum ThemeMode: String, CaseIterable, Identifiable, Codable {
@@ -127,6 +157,8 @@ struct ProviderProfile: Identifiable, Equatable, Codable {
         name.isEmpty ? provider.title : name
     }
 
+    var capabilities: ProviderCapabilities { provider.capabilities }
+
     var detailText: String {
         if provider == .officialCodex { return "本机登录态" }
         guard let url = URL(string: baseURL), let host = url.host else {
@@ -226,6 +258,12 @@ struct ProviderConfiguration {
                   components.user == nil,
                   components.password == nil else {
                 throw UsageServiceError.invalidConfiguration("请输入有效的 http 或 https 服务地址")
+            }
+
+            if scheme == "http", !isAllowedInsecureHTTPHost(components.host ?? "") {
+                throw UsageServiceError.invalidConfiguration(
+                    "出于安全考虑，HTTP 仅允许 localhost、局域网地址或 .local 主机；公网服务请使用 HTTPS"
+                )
             }
 
             var pathComponents = components.path
@@ -353,14 +391,14 @@ struct UsageBucket: Equatable, Decodable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        requests = container.decodeInt(for: [.requests, .requestCount])
-        inputTokens = container.decodeInt(for: [.inputTokens])
-        outputTokens = container.decodeInt(for: [.outputTokens])
-        cacheCreationTokens = container.decodeInt(for: [.cacheCreationTokens])
-        cacheReadTokens = container.decodeInt(for: [.cacheReadTokens])
-        totalTokens = container.decodeInt(for: [.totalTokens])
-        actualCost = container.decodeDouble(for: [.actualCost, .cost])
-        standardCost = container.decodeDouble(for: [.standardCost, .cost])
+        requests = container.decodeNonNegativeInt(for: [.requests, .requestCount])
+        inputTokens = container.decodeNonNegativeInt(for: [.inputTokens])
+        outputTokens = container.decodeNonNegativeInt(for: [.outputTokens])
+        cacheCreationTokens = container.decodeNonNegativeInt(for: [.cacheCreationTokens])
+        cacheReadTokens = container.decodeNonNegativeInt(for: [.cacheReadTokens])
+        totalTokens = container.decodeNonNegativeInt(for: [.totalTokens])
+        actualCost = container.decodeNonNegativeDouble(for: [.actualCost, .cost])
+        standardCost = container.decodeNonNegativeDouble(for: [.standardCost, .cost])
     }
 }
 
@@ -391,9 +429,9 @@ struct UsagePayload: Equatable, Decodable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         today = try container.decodeIfPresent(UsageBucket.self, forKey: .today) ?? .zero
         total = try container.decodeIfPresent(UsageBucket.self, forKey: .total) ?? .zero
-        averageDurationMs = container.decodeDouble(for: [.averageDurationMs])
-        rpm = container.decodeDouble(for: [.rpm])
-        tpm = container.decodeDouble(for: [.tpm])
+        averageDurationMs = container.decodeNonNegativeDouble(for: [.averageDurationMs])
+        rpm = container.decodeNonNegativeDouble(for: [.rpm])
+        tpm = container.decodeNonNegativeDouble(for: [.tpm])
     }
 }
 
@@ -446,16 +484,16 @@ struct DailyUsage: Equatable, Decodable, Identifiable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         date = try container.decodeIfPresent(String.self, forKey: .date) ?? ""
-        requests = container.decodeInt(for: [.requests, .requestCount])
-        inputTokens = container.decodeInt(for: [.inputTokens])
-        outputTokens = container.decodeInt(for: [.outputTokens])
-        cacheReadTokens = container.decodeInt(for: [.cacheReadTokens])
+        requests = container.decodeNonNegativeInt(for: [.requests, .requestCount])
+        inputTokens = container.decodeNonNegativeInt(for: [.inputTokens])
+        outputTokens = container.decodeNonNegativeInt(for: [.outputTokens])
+        cacheReadTokens = container.decodeNonNegativeInt(for: [.cacheReadTokens])
         cacheWriteTokens = max(
-            container.decodeInt(for: [.cacheWriteTokens]),
-            container.decodeInt(for: [.cacheCreationTokens])
+            container.decodeNonNegativeInt(for: [.cacheWriteTokens]),
+            container.decodeNonNegativeInt(for: [.cacheCreationTokens])
         )
-        totalTokens = container.decodeInt(for: [.totalTokens])
-        actualCost = container.decodeDouble(for: [.actualCost, .cost])
+        totalTokens = container.decodeNonNegativeInt(for: [.totalTokens])
+        actualCost = container.decodeNonNegativeDouble(for: [.actualCost, .cost])
     }
 }
 
@@ -557,14 +595,17 @@ struct Sub2APIModelUsage: Decodable {
             resolvedModel += "-\(version)"
         }
         model = resolvedModel
-        requests = container.decodeInt(for: [.requests, .requestCount])
-        inputTokens = container.decodeInt(for: [.inputTokens, .inputTokensCamel])
-        outputTokens = container.decodeInt(for: [.outputTokens, .outputTokensCamel])
-        cacheCreationTokens = container.decodeInt(for: [.cacheCreationTokens, .cacheCreationTokensCamel])
-        cacheReadTokens = container.decodeInt(for: [.cacheReadTokens, .cacheReadTokensCamel])
-        totalTokens = max(container.decodeInt(for: [.totalTokens, .totalTokensCamel]), inputTokens + outputTokens)
-        cost = container.decodeDouble(for: [.cost, .charge])
-        actualCost = container.decodeDouble(for: [.actualCost, .actualCostCamel, .charge, .cost])
+        requests = container.decodeNonNegativeInt(for: [.requests, .requestCount])
+        inputTokens = container.decodeNonNegativeInt(for: [.inputTokens, .inputTokensCamel])
+        outputTokens = container.decodeNonNegativeInt(for: [.outputTokens, .outputTokensCamel])
+        cacheCreationTokens = container.decodeNonNegativeInt(for: [.cacheCreationTokens, .cacheCreationTokensCamel])
+        cacheReadTokens = container.decodeNonNegativeInt(for: [.cacheReadTokens, .cacheReadTokensCamel])
+        totalTokens = max(
+            container.decodeNonNegativeInt(for: [.totalTokens, .totalTokensCamel]),
+            saturatingAdd(inputTokens, outputTokens)
+        )
+        cost = container.decodeNonNegativeDouble(for: [.cost, .charge])
+        actualCost = container.decodeNonNegativeDouble(for: [.actualCost, .actualCostCamel, .charge, .cost])
     }
 }
 
@@ -613,7 +654,7 @@ struct Sub2APIAccountResponse: Decodable {
         let outerSuccess = try? container.decode(Bool.self, forKey: .success)
         let outerMessage = (try? container.decode(String.self, forKey: .message)) ?? ""
         if container.contains(.balance) || container.contains(.accountBalance) {
-            balance = container.decodeDouble(for: [.balance, .accountBalance])
+            balance = container.decodeNonNegativeDouble(for: [.balance, .accountBalance])
             success = outerSuccess
             message = outerMessage
             hasBalance = true
@@ -658,8 +699,8 @@ struct NewAPIAccountResponse: Decodable {
             usedQuota = data.usedQuota
             hasQuotaData = true
         } else {
-            quota = container.decodeDouble(for: [.quota])
-            usedQuota = container.decodeDouble(for: [.usedQuota])
+            quota = container.decodeNonNegativeDouble(for: [.quota])
+            usedQuota = container.decodeNonNegativeDouble(for: [.usedQuota])
             hasQuotaData = directQuotaData
         }
         success = decodedSuccess ?? hasQuotaData
@@ -677,8 +718,8 @@ private struct NewAPIAccountData: Decodable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        quota = container.decodeDouble(for: [.quota])
-        usedQuota = container.decodeDouble(for: [.usedQuota])
+        quota = container.decodeNonNegativeDouble(for: [.quota])
+        usedQuota = container.decodeNonNegativeDouble(for: [.usedQuota])
     }
 }
 
@@ -715,10 +756,10 @@ struct NewAPILog: Decodable {
             resolvedModel += "-\(version)"
         }
         modelName = resolvedModel
-        promptTokens = container.decodeInt(for: [.promptTokens])
-        completionTokens = container.decodeInt(for: [.completionTokens])
-        quota = container.decodeDouble(for: [.quota])
-        useTime = container.decodeDouble(for: [.useTime])
+        promptTokens = container.decodeNonNegativeInt(for: [.promptTokens])
+        completionTokens = container.decodeNonNegativeInt(for: [.completionTokens])
+        quota = container.decodeNonNegativeDouble(for: [.quota])
+        useTime = container.decodeNonNegativeDouble(for: [.useTime])
         createdAt = container.decodeDouble(for: [.createdAt])
         // NewAPI versions have returned both a string and a JSON object here.
         // This field is not used for aggregation, so an unsupported shape must
@@ -726,7 +767,11 @@ struct NewAPILog: Decodable {
         other = (try? container.decode(String.self, forKey: .other)) ?? ""
     }
 
-    var totalTokens: Int { promptTokens + completionTokens }
+    var totalTokens: Int { saturatingAdd(promptTokens, completionTokens) }
+
+    var fingerprint: String {
+        "\(createdAt)|\(modelName)|\(promptTokens)|\(completionTokens)|\(quota)|\(useTime)"
+    }
 }
 
 struct NewAPILogPage: Decodable {
@@ -741,7 +786,7 @@ struct NewAPILogPage: Decodable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         items = try container.decodeIfPresent([NewAPILog].self, forKey: .items) ?? []
-        total = container.decodeInt(for: [.total])
+        total = container.decodeNonNegativeInt(for: [.total])
     }
 }
 
@@ -764,9 +809,9 @@ struct NewAPIStat: Decodable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        quota = container.decodeDouble(for: [.quota])
-        rpm = container.decodeDouble(for: [.rpm])
-        tpm = container.decodeDouble(for: [.tpm])
+        quota = container.decodeNonNegativeDouble(for: [.quota])
+        rpm = container.decodeNonNegativeDouble(for: [.rpm])
+        tpm = container.decodeNonNegativeDouble(for: [.tpm])
     }
 }
 
@@ -884,7 +929,7 @@ struct ModelUsage: Equatable, Identifiable {
         self.requests = requests
         self.inputTokens = inputTokens
         self.outputTokens = outputTokens
-        self.totalTokens = max(totalTokens, inputTokens + outputTokens)
+        self.totalTokens = max(totalTokens, saturatingAdd(inputTokens, outputTokens))
         self.charge = charge
         self.cacheReadTokens = cacheReadTokens
         self.cacheWriteTokens = cacheWriteTokens
@@ -933,6 +978,7 @@ struct OfficialCodexUsage: Equatable {
 enum UsageServiceError: LocalizedError, Equatable {
     case invalidConfiguration(String)
     case invalidResponse
+    case responseTooLarge(Int)
     case httpStatus(Int, String)
     case decoding(String)
     case keychain(OSStatus)
@@ -943,24 +989,47 @@ enum UsageServiceError: LocalizedError, Equatable {
             return message
         case .invalidResponse:
             return "服务返回了无法识别的数据"
+        case .responseTooLarge(let limit):
+            return "服务响应超过安全上限（\(formatByteCount(limit))），请缩小查询范围或检查服务配置"
         case .httpStatus(let status, let message):
-            let lowercasedMessage = message.lowercased()
+            let safeMessage = sanitizedErrorMessage(message) ?? ""
+            let lowercasedMessage = safeMessage.lowercased()
             if lowercasedMessage.contains("chatgpt authentication") || lowercasedMessage.contains("official codex") {
                 return "官方 Codex 未登录 ChatGPT，请先在 Codex 中完成登录"
             }
             if status == 401 {
-                return message.isEmpty ? "API Key 无效或已过期" : message
+                return safeMessage.isEmpty ? "API Key 无效或已过期" : safeMessage
             }
             if status == 403 {
-                return message.isEmpty ? "API Key 没有读取用量的权限" : message
+                return safeMessage.isEmpty ? "API Key 没有读取用量的权限" : safeMessage
             }
-            return message.isEmpty ? "服务请求失败（HTTP \(status)）" : message
+            return safeMessage.isEmpty ? "服务请求失败（HTTP \(status)）" : safeMessage
         case .decoding(let message):
-            return "用量数据格式不兼容：\(message)"
+            return "用量数据格式不兼容：\(sanitizedErrorMessage(message) ?? "未知解析错误")"
         case .keychain:
             return "无法读取或保存 API Key，请检查钥匙串权限"
         }
     }
+}
+
+func sanitizedErrorMessage(_ message: String?, limit: Int = 512) -> String? {
+    guard let message else { return nil }
+    var sanitized = message.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !sanitized.isEmpty else { return nil }
+
+    let replacements: [(String, String)] = [
+        (#"(?i)\bBearer\s+[^\s,;\"']+"#, "Bearer [已隐藏]"),
+        (#"(?i)\bsk-[A-Za-z0-9._~+/=-]+\b"#, "sk-[已隐藏]"),
+        (#"(?i)\b(AccessToken|Authorization|api[-_]?key|token|password)\s*[:=]\s*[^\s,;\"']+"#, "$1=[已隐藏]")
+    ]
+    for (pattern, replacement) in replacements {
+        sanitized = sanitized.replacingOccurrences(
+            of: pattern,
+            with: replacement,
+            options: .regularExpression
+        )
+    }
+    return sanitized.count <= limit ? sanitized : String(sanitized.prefix(limit)) + "..."
 }
 
 private extension KeyedDecodingContainer {
@@ -979,27 +1048,124 @@ private extension KeyedDecodingContainer {
                 return value
             }
             if let value = try? decode(Double.self, forKey: key) {
-                return Int(value)
+                if let number = safeInteger(from: value) {
+                    return number
+                }
             }
-            if let value = try? decode(String.self, forKey: key), let number = Double(value) {
-                return Int(number)
+            if let value = try? decode(String.self, forKey: key),
+               let number = Double(value),
+               let integer = safeInteger(from: number) {
+                return integer
             }
         }
         return 0
     }
 
+    func decodeNonNegativeInt(for keys: [K]) -> Int {
+        max(decodeInt(for: keys), 0)
+    }
+
     func decodeDouble(for keys: [K]) -> Double {
         for key in keys {
             if let value = try? decode(Double.self, forKey: key) {
-                return value
+                if value.isFinite {
+                    return value
+                }
             }
             if let value = try? decode(Int.self, forKey: key) {
                 return Double(value)
             }
-            if let value = try? decode(String.self, forKey: key), let number = Double(value) {
+            if let value = try? decode(String.self, forKey: key),
+               let number = Double(value),
+               number.isFinite {
                 return number
             }
         }
         return 0
     }
+
+    func decodeNonNegativeDouble(for keys: [K]) -> Double {
+        max(decodeDouble(for: keys), 0)
+    }
+}
+
+func safeInteger(from value: Double) -> Int? {
+    guard value.isFinite else { return nil }
+    return Int(exactly: value.rounded(.towardZero))
+}
+
+func saturatingAdd(_ lhs: Int, _ rhs: Int) -> Int {
+    if rhs > 0, lhs > Int.max - rhs { return Int.max }
+    if rhs < 0, lhs < Int.min - rhs { return Int.min }
+    return lhs + rhs
+}
+
+func saturatingSum(_ values: [Int]) -> Int {
+    values.reduce(0, saturatingAdd)
+}
+
+func saturatingAddDouble(_ lhs: Double, _ rhs: Double) -> Double {
+    guard lhs.isFinite, rhs.isFinite else { return 0 }
+    let sum = lhs + rhs
+    return sum.isFinite
+        ? sum
+        : (sum.sign == .minus ? -Double.greatestFiniteMagnitude : Double.greatestFiniteMagnitude)
+}
+
+func saturatingSumDouble(_ values: [Double]) -> Double {
+    values.reduce(0, saturatingAddDouble)
+}
+
+func saturatingSubtractDouble(_ lhs: Double, _ rhs: Double) -> Double {
+    saturatingAddDouble(lhs, -rhs)
+}
+
+private func isAllowedInsecureHTTPHost(_ host: String) -> Bool {
+    let normalizedHost = host.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+    if normalizedHost == "localhost"
+        || normalizedHost.hasSuffix(".localhost")
+        || normalizedHost.hasSuffix(".local")
+        || normalizedHost == "host.docker.internal"
+        || normalizedHost == "host.containers.internal" {
+        return true
+    }
+
+    var ipv4 = in_addr()
+    if normalizedHost.withCString({ inet_pton(AF_INET, $0, &ipv4) }) == 1 {
+        let address = UInt32(bigEndian: ipv4.s_addr)
+        let first = Int((address >> 24) & 0xff)
+        let second = Int((address >> 16) & 0xff)
+        return first == 10
+            || first == 127
+            || (first == 172 && (16...31).contains(second))
+            || (first == 192 && second == 168)
+            || (first == 169 && second == 254)
+    }
+
+    var ipv6 = in6_addr()
+    guard normalizedHost.withCString({ inet_pton(AF_INET6, $0, &ipv6) }) == 1 else {
+        return false
+    }
+    let bytes = withUnsafeBytes(of: ipv6) { Array($0) }
+    let isLoopback = bytes.dropLast().allSatisfy { $0 == 0 } && bytes.last == 1
+    let isUniqueLocal = (bytes[0] & 0xfe) == 0xfc
+    let isLinkLocal = bytes[0] == 0xfe && (bytes[1] & 0xc0) == 0x80
+    let isIPv4Mapped = bytes.prefix(10).allSatisfy { $0 == 0 } && bytes[10] == 0xff && bytes[11] == 0xff
+    if isIPv4Mapped {
+        let first = Int(bytes[12])
+        let second = Int(bytes[13])
+        return first == 10
+            || first == 127
+            || (first == 172 && (16...31).contains(second))
+            || (first == 192 && second == 168)
+            || (first == 169 && second == 254)
+    }
+    return isLoopback || isUniqueLocal || isLinkLocal
+}
+
+private func formatByteCount(_ bytes: Int) -> String {
+    if bytes >= 1_000_000 {
+        return "\(bytes / 1_000_000) MB"
+    }
+    return "\(bytes / 1_000) KB"
 }

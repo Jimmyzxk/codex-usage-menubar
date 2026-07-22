@@ -9,32 +9,44 @@ final class AppState: ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var hasConfiguredAPIKey = false
     @Published private(set) var profileBalances: [String: AccountBalance] = [:]
+    @Published private(set) var profileSnapshots: [String: UsageSnapshot] = [:]
+    @Published private(set) var profileErrors: [String: String] = [:]
+    @Published private(set) var profileLoading: Set<String> = []
+    @Published private(set) var profileHistory: [String: [UsageHistoryEntry]] = [:]
+    @Published private(set) var profileConfigured: [String: Bool] = [:]
 
     private let settingsStore: SettingsStore
     private let keychainStore: KeychainStore
+    private let historyStore: UsageHistoryStore
     private let injectedProvider: UsageProvider?
     private let isPreviewMode: Bool
     private var apiKeys: [String: String] = [:]
     private var loadedAPIKeyProfiles = Set<String>()
     private var refreshTask: Task<Void, Never>?
-    private var requestTask: Task<Void, Never>?
-    private var requestGeneration = 0
+    private var historyLoadTask: Task<Void, Never>?
+    private var requestTasks: [String: Task<Void, Never>] = [:]
+    private var requestGenerations: [String: Int] = [:]
 
     init(
         settingsStore: SettingsStore = SettingsStore(),
         keychainStore: KeychainStore = KeychainStore(),
+        historyStore: UsageHistoryStore = UsageHistoryStore(),
         provider: UsageProvider? = nil,
         initialSettings: AppSettings? = nil,
         previewSnapshot: UsageSnapshot? = nil
     ) {
         self.settingsStore = settingsStore
         self.keychainStore = keychainStore
+        self.historyStore = historyStore
         self.injectedProvider = provider
         self.isPreviewMode = previewSnapshot != nil
         self.settings = initialSettings ?? settingsStore.load()
 
         if let previewSnapshot {
             self.snapshot = previewSnapshot
+            self.profileSnapshots[self.settings.selectedProfileID] = previewSnapshot
+            self.profileHistory[self.settings.selectedProfileID] = historyStore.entries(for: self.settings.selectedProfileID)
+            self.profileConfigured[self.settings.selectedProfileID] = true
             self.hasConfiguredAPIKey = true
             if let balance = previewSnapshot.accountBalance {
                 self.profileBalances[self.settings.selectedProfileID] = balance
@@ -43,11 +55,17 @@ final class AppState: ObservableObject {
         }
 
         let profile = self.settings.selectedProfile
+        historyLoadTask = Task { @MainActor [weak self] in
+            // Let the status item render before decoding the optional local history.
+            await Task.yield()
+            guard let self else { return }
+            self.profileHistory[profile.id] = self.historyStore.entries(for: profile.id)
+        }
         if profile.provider != .officialCodex {
             do {
                 let key = try keychainStore.readAPIKey(
                     for: profile.id,
-                    includeLegacy: profile.id == "legacy-sub2api"
+                    includeLegacy: false
                 ) ?? ""
                 apiKeys[profile.id] = key
                 loadedAPIKeyProfiles.insert(profile.id)
@@ -57,18 +75,21 @@ final class AppState: ObservableObject {
             }
         }
         self.hasConfiguredAPIKey = isConfigured(profile)
+        self.profileConfigured[profile.id] = self.hasConfiguredAPIKey
     }
 
     deinit {
         refreshTask?.cancel()
-        requestTask?.cancel()
+        historyLoadTask?.cancel()
+        requestTasks.values.forEach { $0.cancel() }
     }
 
     var selectedProfile: ProviderProfile { settings.selectedProfile }
 
+    var hasAnyConfiguredProfile: Bool { profileConfigured.values.contains(true) }
+
     func start() {
         guard !isPreviewMode else { return }
-        guard hasConfiguredAPIKey else { return }
         scheduleRefreshTimer()
         refresh()
     }
@@ -76,48 +97,8 @@ final class AppState: ObservableObject {
     func refresh() {
         guard !isPreviewMode else { return }
         guard !isLoading else { return }
-        let profile = selectedProfile
-        let apiKey = apiKeys[profile.id] ?? ""
-        guard profile.provider == .officialCodex || !apiKey.isEmpty else {
-            hasConfiguredAPIKey = false
-            return
-        }
-
-        do {
-            let configuration = try ProviderConfiguration(
-                provider: profile.provider,
-                baseURL: profile.baseURL,
-                apiKey: apiKey,
-                newAPIUserID: profile.newAPIUserID
-            )
-            let provider = injectedProvider ?? UsageProviderFactory.make(for: profile.provider)
-            isLoading = true
-            lastError = nil
-            requestGeneration += 1
-            let generation = requestGeneration
-
-            requestTask = Task { @MainActor [weak self] in
-                guard let self else { return }
-                do {
-                    let nextSnapshot = try await provider.fetchUsage(configuration: configuration)
-                    guard self.isCurrentRequest(generation, profileID: profile.id) else { return }
-                    self.snapshot = nextSnapshot
-                    if let balance = nextSnapshot.accountBalance {
-                        self.profileBalances[profile.id] = balance
-                    }
-                    self.lastError = nil
-                } catch is CancellationError {
-                    return
-                } catch {
-                    guard self.isCurrentRequest(generation, profileID: profile.id) else { return }
-                    self.lastError = error.localizedDescription
-                }
-                guard self.isCurrentRequest(generation, profileID: profile.id) else { return }
-                self.isLoading = false
-                self.requestTask = nil
-            }
-        } catch {
-            lastError = error.localizedDescription
+        for profile in settings.profiles {
+            refreshProfile(profile.id)
         }
     }
 
@@ -139,23 +120,18 @@ final class AppState: ObservableObject {
         guard settings.profiles.contains(where: { $0.id == profileID }) else { return }
         guard profileID != settings.selectedProfileID else { return }
 
-        refreshTask?.cancel()
-        refreshTask = nil
-        cancelInFlightRequest()
-        snapshot = nil
-        lastError = nil
         settings.selectedProfileID = profileID
         settingsStore.save(settings)
 
         do {
             let profile = selectedProfile
-            if profile.provider != .officialCodex {
-                _ = try loadStoredAPIKey(for: profile)
-            }
+            if profile.provider != .officialCodex { _ = try loadStoredAPIKey(for: profile) }
             hasConfiguredAPIKey = isConfigured(profile)
-            if hasConfiguredAPIKey {
-                scheduleRefreshTimer()
-                refresh()
+            profileConfigured[profile.id] = hasConfiguredAPIKey
+            snapshot = profileSnapshots[profileID]
+            lastError = profileErrors[profileID]
+            if hasConfiguredAPIKey && snapshot == nil {
+                refreshProfile(profileID)
             }
         } catch {
             hasConfiguredAPIKey = false
@@ -204,7 +180,7 @@ final class AppState: ObservableObject {
             panelSize: settings.panelSize,
             tokenDisplayMode: settings.tokenDisplayMode
         )
-        cancelInFlightRequest()
+        cancelProfileRequest(profileID)
 
         if provider == .officialCodex {
             try keychainStore.deleteAPIKey(
@@ -229,11 +205,15 @@ final class AppState: ObservableObject {
         loadedAPIKeyProfiles.insert(profileID)
         settings = nextSettings
         hasConfiguredAPIKey = isConfigured(profile)
+        profileConfigured[profile.id] = hasConfiguredAPIKey
         lastError = nil
         snapshot = nil
+        profileSnapshots.removeValue(forKey: profileID)
+        profileErrors.removeValue(forKey: profileID)
         profileBalances.removeValue(forKey: profileID)
+        profileHistory[profileID] = historyStore.entries(for: profileID)
         scheduleRefreshTimer()
-        refresh()
+        refreshProfile(profileID)
     }
 
     func deleteProfile(_ profileID: String) {
@@ -243,7 +223,7 @@ final class AppState: ObservableObject {
         }
         guard settings.profiles.contains(where: { $0.id == profileID }) else { return }
 
-        cancelInFlightRequest()
+        cancelProfileRequest(profileID)
         do {
             try keychainStore.deleteAPIKey(
                 for: profileID,
@@ -270,13 +250,18 @@ final class AppState: ObservableObject {
         settingsStore.save(settings)
         apiKeys.removeValue(forKey: profileID)
         loadedAPIKeyProfiles.remove(profileID)
+        profileSnapshots.removeValue(forKey: profileID)
+        profileErrors.removeValue(forKey: profileID)
+        profileLoading.remove(profileID)
+        profileHistory.removeValue(forKey: profileID)
+        profileConfigured.removeValue(forKey: profileID)
         profileBalances.removeValue(forKey: profileID)
-        snapshot = nil
+        snapshot = profileSnapshots[nextSelectedID]
         lastError = nil
-        isLoading = false
+        updateLoadingState()
         hasConfiguredAPIKey = isConfigured(selectedProfile)
         scheduleRefreshTimer()
-        refresh()
+        if snapshot == nil { refreshProfile(nextSelectedID) }
     }
 
     func setTheme(_ theme: ThemeMode) {
@@ -333,14 +318,93 @@ final class AppState: ObservableObject {
     }
 
     private func isCurrentRequest(_ generation: Int, profileID: String) -> Bool {
-        requestGeneration == generation && selectedProfile.id == profileID
+        requestGenerations[profileID] == generation
     }
 
-    private func cancelInFlightRequest() {
-        requestGeneration += 1
-        requestTask?.cancel()
-        requestTask = nil
-        isLoading = false
+    private func cancelProfileRequest(_ profileID: String) {
+        requestGenerations[profileID, default: 0] += 1
+        requestTasks[profileID]?.cancel()
+        requestTasks.removeValue(forKey: profileID)
+        profileLoading.remove(profileID)
+        updateLoadingState()
+    }
+
+    private func refreshProfile(_ profileID: String) {
+        guard let profile = settings.profiles.first(where: { $0.id == profileID }) else { return }
+        cancelProfileRequest(profileID)
+        do {
+            let apiKey: String
+            if profile.provider == .officialCodex {
+                apiKey = ""
+            } else {
+                apiKey = try loadStoredAPIKeySilently(for: profile)
+            }
+            guard profile.provider == .officialCodex || !apiKey.isEmpty else {
+                hasConfiguredAPIKey = profile.id == selectedProfile.id ? false : hasConfiguredAPIKey
+                profileConfigured[profile.id] = false
+                profileErrors[profile.id] = "尚未配置访问凭据"
+                if profile.id == selectedProfile.id { lastError = profileErrors[profile.id] }
+                return
+            }
+            let configuration = try ProviderConfiguration(
+                provider: profile.provider,
+                baseURL: profile.baseURL,
+                apiKey: apiKey,
+                newAPIUserID: profile.newAPIUserID
+            )
+            let provider = injectedProvider ?? UsageProviderFactory.make(for: profile.provider)
+            profileConfigured[profile.id] = true
+            profileLoading.insert(profileID)
+            profileErrors.removeValue(forKey: profileID)
+            if profile.id == selectedProfile.id { lastError = nil }
+            updateLoadingState()
+            let generation = requestGenerations[profileID, default: 0] + 1
+            requestGenerations[profileID] = generation
+            requestTasks[profileID] = Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    let nextSnapshot = try await provider.fetchUsage(configuration: configuration)
+                    guard self.isCurrentRequest(generation, profileID: profile.id) else { return }
+                    self.profileSnapshots[profile.id] = nextSnapshot
+                    self.historyStore.record(snapshot: nextSnapshot, profile: profile)
+                    self.profileHistory[profile.id] = self.historyStore.entries(for: profile.id)
+                    if let balance = nextSnapshot.accountBalance { self.profileBalances[profile.id] = balance }
+                    if profile.id == self.selectedProfile.id {
+                        self.snapshot = nextSnapshot
+                        self.lastError = nil
+                    }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard self.isCurrentRequest(generation, profileID: profile.id) else { return }
+                    self.profileErrors[profile.id] = error.localizedDescription
+                    if profile.id == self.selectedProfile.id { self.lastError = error.localizedDescription }
+                }
+                guard self.isCurrentRequest(generation, profileID: profile.id) else { return }
+                self.profileLoading.remove(profile.id)
+                self.requestTasks.removeValue(forKey: profile.id)
+                self.updateLoadingState()
+            }
+        } catch {
+            profileConfigured[profile.id] = false
+            profileErrors[profile.id] = error.localizedDescription
+            if profile.id == selectedProfile.id {
+                hasConfiguredAPIKey = false
+                lastError = error.localizedDescription
+            }
+        }
+    }
+
+    private func updateLoadingState() {
+        isLoading = !profileLoading.isEmpty
+    }
+
+    private func loadStoredAPIKeySilently(for profile: ProviderProfile) throws -> String {
+        guard !loadedAPIKeyProfiles.contains(profile.id) else { return apiKeys[profile.id] ?? "" }
+        let key = try keychainStore.readAPIKey(for: profile.id, includeLegacy: false) ?? ""
+        apiKeys[profile.id] = key
+        loadedAPIKeyProfiles.insert(profile.id)
+        return key
     }
 
     private func isConfigured(_ profile: ProviderProfile) -> Bool {

@@ -52,6 +52,41 @@ struct ModelsSmoke {
             requireAPIKey: false
         )
         precondition(clearedConfig.apiKey.isEmpty)
+        _ = try ProviderConfiguration(baseURL: "http://10.10.10.116:8080", apiKey: "sk-test")
+        do {
+            _ = try ProviderConfiguration(baseURL: "http://example.com", apiKey: "sk-test")
+            preconditionFailure("public HTTP must be rejected")
+        } catch UsageServiceError.invalidConfiguration {
+            // Expected: credentials must not be sent over public HTTP.
+        }
+        do {
+            _ = try ProviderConfiguration(baseURL: "http://fc-public.example.com", apiKey: "sk-test")
+            preconditionFailure("public hostname must not pass private IPv6 checks")
+        } catch UsageServiceError.invalidConfiguration {
+            // Expected: only parsed private IP addresses are allowed.
+        }
+        do {
+            _ = try ProviderConfiguration(baseURL: "https://user:password@example.com", apiKey: "sk-test")
+            preconditionFailure("URLs with userinfo must be rejected")
+        } catch UsageServiceError.invalidConfiguration {
+            // Expected: credentials must not be embedded in service URLs.
+        }
+
+        let redacted = sanitizedErrorMessage(
+            "Authorization: Bearer sk-live-secret AccessToken=another-secret"
+        )!
+        precondition(!redacted.contains("sk-live-secret"))
+        precondition(!redacted.contains("another-secret"))
+        precondition(redacted.count < 512)
+
+        let unsafeNumber = #"{"usage":{"today":{"requests":1e300,"input_tokens":1e300,"output_tokens":1e300,"total_tokens":1e300},"total":{}}}"#.data(using: .utf8)!
+        let safeResponse = try JSONDecoder().decode(Sub2APIUsageResponse.self, from: unsafeNumber)
+        precondition(safeResponse.usage.today.requests == 0)
+        let negativeNumber = #"{"usage":{"today":{"requests":-3,"input_tokens":-10,"output_tokens":-20,"total_tokens":-30},"total":{}}}"#.data(using: .utf8)!
+        let normalizedResponse = try JSONDecoder().decode(Sub2APIUsageResponse.self, from: negativeNumber)
+        precondition(normalizedResponse.usage.today.requests == 0)
+        precondition(normalizedResponse.usage.today.totalTokens == 0)
+        precondition(saturatingAdd(Int.max, 1) == Int.max)
 
         let newAPIConfig = try ProviderConfiguration(
             provider: .newAPI,

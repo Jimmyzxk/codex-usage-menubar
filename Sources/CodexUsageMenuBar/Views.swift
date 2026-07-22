@@ -219,7 +219,7 @@ struct ContentView: View {
 
     @ViewBuilder
     private var content: some View {
-        if !appState.hasConfiguredAPIKey {
+        if !appState.hasConfiguredAPIKey && !appState.hasAnyConfiguredProfile {
             StatePanel(
                 mark: true,
                 icon: nil,
@@ -234,11 +234,28 @@ struct ContentView: View {
                     staleSyncBanner(error)
                     Divider()
                 }
+                if appState.settings.profiles.count > 1 {
+                    providerOverview
+                    Divider()
+                }
                 if let official = snapshot.official {
                     officialContent(snapshot, usage: official)
                 } else {
                     proxyContent(snapshot)
                 }
+            }
+        } else if appState.hasAnyConfiguredProfile && appState.settings.profiles.count > 1 {
+            VStack(alignment: .leading, spacing: 0) {
+                providerOverview
+                Divider()
+                StatePanel(
+                    mark: false,
+                    icon: "arrow.left.arrow.right",
+                    title: "选择要查看的供应商",
+                    message: "从上方总览中选择一个已配置的供应商。",
+                    buttonTitle: "刷新",
+                    action: appState.refresh
+                )
             }
         } else if let error = appState.lastError {
             StatePanel(
@@ -259,6 +276,97 @@ struct ContentView: View {
                 action: appState.refresh
             )
         }
+    }
+
+    private var providerOverview: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("供应商总览")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                Spacer()
+                Text("\(appState.settings.profiles.count) 个")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            LazyVGrid(
+                columns: [GridItem(.flexible(), spacing: 7), GridItem(.flexible(), spacing: 7)],
+                spacing: 7
+            ) {
+                ForEach(appState.settings.profiles) { profile in
+                    providerSummaryRow(profile)
+                }
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 11)
+    }
+
+    private func providerSummaryRow(_ profile: ProviderProfile) -> some View {
+        let snapshot = appState.profileSnapshots[profile.id]
+        let isSelected = profile.id == appState.settings.selectedProfileID
+        return Button {
+            appState.selectProfile(profile.id)
+        } label: {
+            HStack(spacing: 7) {
+                Circle()
+                    .fill(providerStatusColor(profile))
+                    .frame(width: 6, height: 6)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(profile.displayName)
+                        .font(.system(size: 10, weight: .semibold, design: .rounded))
+                        .lineLimit(1)
+                    Text(profile.provider.title)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 3)
+                VStack(alignment: .trailing, spacing: 2) {
+                    if let snapshot {
+                        Text(formatTokenCount(snapshot.today.totalTokens, mode: appState.settings.tokenDisplayMode))
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .lineLimit(1)
+                        if let balance = snapshot.accountBalance {
+                            Text(formatAccountBalance(balance))
+                                .font(.system(size: 9, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    } else if appState.profileLoading.contains(profile.id) {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Text(providerStatusLabel(profile))
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isSelected ? visualStyle.accent.opacity(0.10) : visualStyle.mutedSurface)
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(isSelected ? visualStyle.accent.opacity(0.34) : visualStyle.outline, lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .help("切换到 \(profile.displayName)")
+    }
+
+    private func providerStatusColor(_ profile: ProviderProfile) -> Color {
+        if appState.profileLoading.contains(profile.id) { return visualStyle.accent }
+        if appState.profileErrors[profile.id] != nil { return visualStyle.warning }
+        if appState.profileSnapshots[profile.id] != nil { return visualStyle.positive }
+        return visualStyle.separator
+    }
+
+    private func providerStatusLabel(_ profile: ProviderProfile) -> String {
+        if appState.profileConfigured[profile.id] != true { return "未配置" }
+        if appState.profileErrors[profile.id] != nil { return "读取失败" }
+        return "等待同步"
     }
 
     private func staleSyncBanner(_ message: String) -> some View {
@@ -297,11 +405,19 @@ struct ContentView: View {
         return displayTokenCount(value)
     }
 
+    private func effectiveDailyUsage(_ snapshot: UsageSnapshot) -> [DailyUsage] {
+        mergeDailyUsage(
+            snapshot.dailyUsage,
+            historyEntries: appState.profileHistory[appState.selectedProfile.id] ?? []
+        )
+    }
+
     @ViewBuilder
     private func proxyContent(_ snapshot: UsageSnapshot) -> some View {
+        let dailyUsage = effectiveDailyUsage(snapshot)
         switch appState.settings.dashboardTheme {
         case .pulse:
-            pulseContent(snapshot)
+            pulseContent(snapshot, dailyUsage: dailyUsage)
         default:
             VStack(alignment: .leading, spacing: 0) {
                 proxyOverview(snapshot)
@@ -309,9 +425,9 @@ struct ContentView: View {
                     Divider().padding(.horizontal, 18)
                     modelUsage(snapshot.modelUsage, billingMode: snapshot.billingMode)
                 }
-                if !snapshot.dailyUsage.isEmpty {
+                if !dailyUsage.isEmpty {
                     Divider().padding(.horizontal, 18)
-                    history(snapshot.dailyUsage, billingMode: snapshot.billingMode)
+                    history(dailyUsage, billingMode: snapshot.billingMode)
                 }
             }
             .padding(.bottom, 14)
@@ -330,7 +446,7 @@ struct ContentView: View {
         case .graphite:
             graphiteOverview(snapshot)
         case .pulse:
-            pulseOverview(snapshot, dailyUsage: recentDailyUsage(snapshot.dailyUsage, limit: 7, ascending: true))
+            pulseOverview(snapshot, dailyUsage: recentDailyUsage(effectiveDailyUsage(snapshot), limit: 7, ascending: true))
         }
     }
 
@@ -525,8 +641,8 @@ struct ContentView: View {
         .padding(.bottom, 14)
     }
 
-    private func pulseContent(_ snapshot: UsageSnapshot) -> some View {
-        let recentUsage = recentDailyUsage(snapshot.dailyUsage, limit: 7, ascending: true)
+    private func pulseContent(_ snapshot: UsageSnapshot, dailyUsage: [DailyUsage]) -> some View {
+        let recentUsage = recentDailyUsage(dailyUsage, limit: 7, ascending: true)
 
         return VStack(alignment: .leading, spacing: 0) {
             pulseOverview(snapshot, dailyUsage: recentUsage)
@@ -1238,6 +1354,7 @@ struct SettingsView: View {
     @State private var pendingNewProfile = false
     @State private var pendingGlobalSettings = false
     @State private var settingsScope: SettingsScope = .connection
+    @State private var isProfileListExpanded = true
 
     init(onCloseWindow: (() -> Void)? = nil) {
         self.onCloseWindow = onCloseWindow
@@ -1274,6 +1391,14 @@ struct SettingsView: View {
         URLComponents(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines))?
             .scheme?
             .lowercased() == "http"
+    }
+
+    private var profileListCount: Int {
+        appState.settings.profiles.count + (isDraftNew ? 1 : 0)
+    }
+
+    private var profileListHeight: CGFloat {
+        min(max(CGFloat(profileListCount) * 56, 56), 252)
     }
 
     var body: some View {
@@ -1640,13 +1765,28 @@ struct SettingsView: View {
     private var profileSection: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                VStack(alignment: .leading, spacing: 3) {
-                    Text("连接配置")
-                        .font(.headline.weight(.semibold))
-                    Text("每项独立保存地址与认证信息")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        isProfileListExpanded.toggle()
+                    }
+                } label: {
+                    HStack(alignment: .firstTextBaseline, spacing: 7) {
+                        Image(systemName: isProfileListExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(visualStyle.accent)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("连接配置")
+                                .font(.headline.weight(.semibold))
+                            Text("每项独立保存地址与认证信息")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("供应商列表")
+                .accessibilityValue(isProfileListExpanded ? "已展开" : "已收起")
+                .help(isProfileListExpanded ? "收起供应商列表" : "展开供应商列表")
                 Spacer(minLength: 8)
                 Button {
                     requestNewProfile()
@@ -1659,32 +1799,38 @@ struct SettingsView: View {
                 .help("新增供应商配置")
             }
 
-            VStack(spacing: 4) {
-                ForEach(appState.settings.profiles) { profile in
-                    profileRow(profile)
-                }
-                if isDraftNew {
-                    HStack(spacing: 10) {
-                        Circle()
-                            .fill(visualStyle.accent)
-                            .frame(width: 7, height: 7)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("新供应商")
-                                .font(.callout.weight(.medium))
-                            Text("正在编辑")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+            if isProfileListExpanded {
+                ScrollView(.vertical, showsIndicators: profileListCount > 4) {
+                    VStack(spacing: 4) {
+                        ForEach(appState.settings.profiles) { profile in
+                            profileRow(profile)
                         }
-                        Spacer(minLength: 8)
-                        Image(systemName: "pencil")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(visualStyle.accent)
+                        if isDraftNew {
+                            HStack(spacing: 10) {
+                                Circle()
+                                    .fill(visualStyle.accent)
+                                    .frame(width: 7, height: 7)
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("新供应商")
+                                        .font(.callout.weight(.medium))
+                                    Text("正在编辑")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 8)
+                                Image(systemName: "pencil")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(visualStyle.accent)
+                            }
+                            .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
+                            .padding(.horizontal, 12)
+                            .background(visualStyle.accent.opacity(0.10))
+                            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
                     }
-                    .frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
-                    .padding(.horizontal, 12)
-                    .background(visualStyle.accent.opacity(0.10))
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
+                .frame(height: profileListHeight)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
 
             Divider()
@@ -1976,8 +2122,15 @@ struct SettingsView: View {
     private func copyAPIKey() {
         guard !apiKey.isEmpty else { return }
         let normalizedKey = normalizedAPIKey(apiKey)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(normalizedKey, forType: .string)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(normalizedKey, forType: .string)
+        let copyChangeCount = pasteboard.changeCount
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
+            guard pasteboard.changeCount == copyChangeCount,
+                  pasteboard.string(forType: .string) == normalizedKey else { return }
+            pasteboard.clearContents()
+        }
         errorMessage = nil
         testMessage = nil
         testSucceeded = false
@@ -2456,14 +2609,15 @@ private struct PulseDonut: View {
     let colors: [Color]
 
     var body: some View {
-        let total = max(input + output + cache, 1)
+        let totalTokens = saturatingSum([input, output, cache])
+        let total = max(totalTokens, 1)
         let inputEnd = CGFloat(input) / CGFloat(total)
         let outputEnd = inputEnd + CGFloat(output) / CGFloat(total)
 
         return ZStack {
             Circle()
                 .stroke(visualStyle.separator.opacity(0.18), lineWidth: 10)
-            if input + output + cache > 0 {
+            if totalTokens > 0 {
                 Circle()
                     .trim(from: 0, to: inputEnd)
                     .stroke(colors[0], style: StrokeStyle(lineWidth: 10, lineCap: .butt))
@@ -2776,7 +2930,7 @@ private struct TokenCompositionBar: View {
 
     var body: some View {
         GeometryReader { proxy in
-            let total = input + output + cache
+            let total = saturatingSum([input, output, cache])
             if total > 0 {
                 HStack(spacing: 0) {
                     Rectangle()
@@ -2966,6 +3120,28 @@ private func displayDate(_ value: String) -> String {
 private func recentDailyUsage(_ items: [DailyUsage], limit: Int, ascending: Bool) -> [DailyUsage] {
     let recent = Array(items.sorted { $0.date > $1.date }.prefix(limit))
     return ascending ? recent.reversed() : recent
+}
+
+private func mergeDailyUsage(
+    _ serverItems: [DailyUsage],
+    historyEntries: [UsageHistoryEntry]
+) -> [DailyUsage] {
+    var items = Dictionary(uniqueKeysWithValues: serverItems.map { ($0.date, $0) })
+    let groupedHistory = Dictionary(grouping: historyEntries, by: \.dateKey)
+    for (date, entries) in groupedHistory where items[date] == nil {
+        guard let latest = entries.max(by: { $0.capturedAt < $1.capturedAt }) else { continue }
+        items[date] = DailyUsage(
+            date: date,
+            requests: latest.requests,
+            inputTokens: latest.inputTokens,
+            outputTokens: latest.outputTokens,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            totalTokens: latest.totalTokens,
+            actualCost: latest.charge
+        )
+    }
+    return items.values.sorted { $0.date > $1.date }
 }
 
 private func planTitle(_ value: String?) -> String {

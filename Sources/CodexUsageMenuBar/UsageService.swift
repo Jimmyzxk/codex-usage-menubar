@@ -1,6 +1,97 @@
 import Foundation
 import Darwin
 
+private let maxResponseBodyBytes = 10 * 1024 * 1024
+private let maxPaginatedResponseBytes = 50 * 1024 * 1024
+private let maxProcessLineBytes = 1 * 1024 * 1024
+private let maxProcessOutputBytes = 10 * 1024 * 1024
+
+private final class SameOriginRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let sourceURL = task.currentRequest?.url ?? task.originalRequest?.url,
+              let destinationURL = request.url,
+              isAllowedRedirect(from: sourceURL, to: destinationURL) else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+
+    private func isAllowedRedirect(from source: URL, to destination: URL) -> Bool {
+        guard let sourceComponents = URLComponents(url: source, resolvingAgainstBaseURL: false),
+              let destinationComponents = URLComponents(url: destination, resolvingAgainstBaseURL: false),
+              let sourceHost = sourceComponents.host?.lowercased(),
+              let destinationHost = destinationComponents.host?.lowercased(),
+              sourceComponents.user == nil,
+              sourceComponents.password == nil,
+              destinationComponents.user == nil,
+              destinationComponents.password == nil,
+              sourceHost == destinationHost else {
+            return false
+        }
+
+        let sourceScheme = sourceComponents.scheme?.lowercased()
+        let destinationScheme = destinationComponents.scheme?.lowercased()
+        guard ["http", "https"].contains(sourceScheme),
+              ["http", "https"].contains(destinationScheme) else {
+            return false
+        }
+        if sourceScheme == destinationScheme {
+            return normalizedPort(for: sourceComponents) == normalizedPort(for: destinationComponents)
+        }
+        guard sourceScheme == "http", destinationScheme == "https" else { return false }
+        let sourcePort = normalizedPort(for: sourceComponents)
+        let destinationPort = normalizedPort(for: destinationComponents)
+        return sourcePort == destinationPort || (sourcePort == 80 && destinationPort == 443)
+    }
+
+    private func normalizedPort(for components: URLComponents) -> Int? {
+        if let port = components.port { return port }
+        switch components.scheme?.lowercased() {
+        case "http": return 80
+        case "https": return 443
+        default: return nil
+        }
+    }
+}
+
+private func boundedData(
+    for request: URLRequest,
+    using session: URLSession
+) async throws -> (Data, URLResponse) {
+    do {
+        let (bytes, response) = try await session.bytes(for: request)
+        if response.expectedContentLength > Int64(maxResponseBodyBytes) {
+            throw UsageServiceError.responseTooLarge(maxResponseBodyBytes)
+        }
+        var data = Data()
+        if response.expectedContentLength > 0 {
+            data.reserveCapacity(min(Int(response.expectedContentLength), maxResponseBodyBytes))
+        }
+        for try await byte in bytes {
+            guard data.count < maxResponseBodyBytes else {
+                throw UsageServiceError.responseTooLarge(maxResponseBodyBytes)
+            }
+            data.append(byte)
+        }
+        return (data, response)
+    } catch is CancellationError {
+        throw CancellationError()
+    } catch let error as URLError where error.code == .cancelled {
+        throw CancellationError()
+    }
+}
+
+private func limitedResponseMessage(_ message: String?) -> String? {
+    sanitizedErrorMessage(message)
+}
+
 protocol UsageProvider {
     var displayName: String { get }
     func fetchUsage(configuration: ProviderConfiguration) async throws -> UsageSnapshot
@@ -23,8 +114,8 @@ func selectTodayModelUsage(
         // Both endpoints have existed in versions that ignored the requested
         // period. Reject obviously cumulative results before showing them as
         // today's model usage.
-        let modelRequests = activeModels.reduce(0) { $0 + $1.requests }
-        let modelTokens = activeModels.reduce(0) { $0 + $1.totalTokens }
+        let modelRequests = saturatingSum(activeModels.map(\.requests))
+        let modelTokens = saturatingSum(activeModels.map(\.totalTokens))
         let requestsPlausible = today.requests == 0
             || Double(modelRequests) <= Double(today.requests) * 2.0 + 10
         let tokensPlausible = today.totalTokens == 0
@@ -55,7 +146,11 @@ final class Sub2APIUsageProvider: UsageProvider {
             configuration.timeoutIntervalForRequest = 15
             configuration.timeoutIntervalForResource = 20
             configuration.waitsForConnectivity = false
-            self.session = URLSession(configuration: configuration)
+            self.session = URLSession(
+                configuration: configuration,
+                delegate: SameOriginRedirectDelegate(),
+                delegateQueue: nil
+            )
         }
         self.decoder = JSONDecoder()
     }
@@ -81,7 +176,7 @@ final class Sub2APIUsageProvider: UsageProvider {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         do {
-            let (data, response) = try await session.data(for: request)
+            let (data, response) = try await boundedData(for: request, using: session)
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw UsageServiceError.invalidResponse
             }
@@ -98,16 +193,34 @@ final class Sub2APIUsageProvider: UsageProvider {
                 if payload.success == false || payload.code.map({ $0 != 0 }) == true {
                     throw UsageServiceError.httpStatus(
                         httpResponse.statusCode,
-                        payload.message.isEmpty ? "Sub2API 返回了失败状态" : payload.message
+                        limitedResponseMessage(payload.message) ?? "Sub2API 返回了失败状态"
                     )
                 }
-                let dashboardModelUsage = try? await fetchModelUsage(configuration: configuration)
+                let dashboardModelUsage: [ModelUsage]?
+                do {
+                    dashboardModelUsage = try await fetchModelUsage(configuration: configuration)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch let error as URLError where error.code == .cancelled {
+                    throw CancellationError()
+                } catch {
+                    dashboardModelUsage = nil
+                }
                 let modelUsage = selectTodayModelUsage(
                     primary: payload.modelUsage,
                     fallback: dashboardModelUsage,
                     today: payload.usage.today
                 )
-                let accountBalance = try? await fetchAccountBalance(configuration: configuration)
+                let accountBalance: AccountBalance?
+                do {
+                    accountBalance = try await fetchAccountBalance(configuration: configuration)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch let error as URLError where error.code == .cancelled {
+                    throw CancellationError()
+                } catch {
+                    accountBalance = nil
+                }
                 return UsageSnapshot(
                     providerName: displayName,
                     today: payload.usage.today,
@@ -121,11 +234,19 @@ final class Sub2APIUsageProvider: UsageProvider {
                     accountBalance: accountBalance ?? nil,
                     fetchedAt: Date()
                 )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as URLError where error.code == .cancelled {
+                throw CancellationError()
             } catch {
                 throw UsageServiceError.decoding(error.localizedDescription)
             }
         } catch let error as UsageServiceError {
             throw error
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
         } catch {
             throw UsageServiceError.httpStatus(0, networkMessage(for: error))
         }
@@ -138,7 +259,7 @@ final class Sub2APIUsageProvider: UsageProvider {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await boundedData(for: request, using: session)
         guard let httpResponse = response as? HTTPURLResponse,
               (200..<300).contains(httpResponse.statusCode) else {
             throw UsageServiceError.invalidResponse
@@ -147,7 +268,7 @@ final class Sub2APIUsageProvider: UsageProvider {
         guard account.success != false, account.hasBalance else {
             throw UsageServiceError.httpStatus(
                 httpResponse.statusCode,
-                account.message.isEmpty ? "Sub2API 账户余额接口没有返回余额" : account.message
+                limitedResponseMessage(account.message) ?? "Sub2API 账户余额接口没有返回余额"
             )
         }
         return AccountBalance(value: account.balance, rawValue: nil, label: "账户余额", unit: .currency)
@@ -171,7 +292,7 @@ final class Sub2APIUsageProvider: UsageProvider {
         request.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await boundedData(for: request, using: session)
         guard let httpResponse = response as? HTTPURLResponse,
               (200..<300).contains(httpResponse.statusCode) else {
             throw UsageServiceError.invalidResponse
@@ -205,7 +326,7 @@ final class Sub2APIUsageProvider: UsageProvider {
 
         let payload = try? decoder.decode(ErrorPayload.self, from: data)
         let message = payload?.message ?? payload?.error ?? payload?.code ?? ""
-        return .httpStatus(status, message)
+        return .httpStatus(status, limitedResponseMessage(message) ?? "")
     }
 
     private func networkMessage(for error: Error) -> String {
@@ -257,7 +378,11 @@ final class NewAPIUsageProvider: UsageProvider {
             configuration.timeoutIntervalForRequest = 15
             configuration.timeoutIntervalForResource = 20
             configuration.waitsForConnectivity = false
-            self.session = URLSession(configuration: configuration)
+            self.session = URLSession(
+                configuration: configuration,
+                delegate: SameOriginRedirectDelegate(),
+                delegateQueue: nil
+            )
         }
         self.decoder = JSONDecoder()
     }
@@ -294,14 +419,23 @@ final class NewAPIUsageProvider: UsageProvider {
         let logs = try await recentLogs
         let todayLogs = logs.items.filter { isInDay($0.createdAt, start: todayStart, calendar: calendar) }
         let todayStats = try await stats
-        let accountBalance = try? await fetchAccountBalance(configuration: configuration)
+        let accountBalance: AccountBalance?
+        do {
+            accountBalance = try await fetchAccountBalance(configuration: configuration)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
+        } catch {
+            accountBalance = nil
+        }
 
-        let todayTokens = todayLogs.reduce(0) { $0 + $1.totalTokens }
-        let todayInput = todayLogs.reduce(0) { $0 + $1.promptTokens }
-        let todayOutput = todayLogs.reduce(0) { $0 + $1.completionTokens }
+        let todayTokens = saturatingSum(todayLogs.map(\.totalTokens))
+        let todayInput = saturatingSum(todayLogs.map(\.promptTokens))
+        let todayOutput = saturatingSum(todayLogs.map(\.completionTokens))
         let averageDuration = todayLogs.isEmpty
             ? 0
-            : todayLogs.reduce(0) { $0 + $1.useTime } / Double(todayLogs.count)
+            : saturatingSumDouble(todayLogs.map(\.useTime)) / Double(todayLogs.count)
 
         let today = UsageBucket(
             requests: todayLogs.count,
@@ -322,12 +456,12 @@ final class NewAPIUsageProvider: UsageProvider {
             return DailyUsage(
                 date: key,
                 requests: items.count,
-                inputTokens: items.reduce(0) { $0 + $1.promptTokens },
-                outputTokens: items.reduce(0) { $0 + $1.completionTokens },
+                inputTokens: saturatingSum(items.map(\.promptTokens)),
+                outputTokens: saturatingSum(items.map(\.completionTokens)),
                 cacheReadTokens: 0,
                 cacheWriteTokens: 0,
-                totalTokens: items.reduce(0) { $0 + $1.totalTokens },
-                actualCost: items.reduce(0) { $0 + $1.quota }
+                totalTokens: saturatingSum(items.map(\.totalTokens)),
+                actualCost: saturatingSumDouble(items.map(\.quota))
             )
         }
         .sorted { $0.date > $1.date }
@@ -337,10 +471,10 @@ final class NewAPIUsageProvider: UsageProvider {
                 ModelUsage(
                     id: model,
                     requests: items.count,
-                    inputTokens: items.reduce(0) { $0 + $1.promptTokens },
-                    outputTokens: items.reduce(0) { $0 + $1.completionTokens },
-                    totalTokens: items.reduce(0) { $0 + $1.totalTokens },
-                    charge: items.reduce(0) { $0 + $1.quota }
+                    inputTokens: saturatingSum(items.map(\.promptTokens)),
+                    outputTokens: saturatingSum(items.map(\.completionTokens)),
+                    totalTokens: saturatingSum(items.map(\.totalTokens)),
+                    charge: saturatingSumDouble(items.map(\.quota))
                 )
             }
             .sorted { $0.totalTokens > $1.totalTokens }
@@ -377,10 +511,13 @@ final class NewAPIUsageProvider: UsageProvider {
             throw UsageServiceError.decoding("NewAPI 账户余额接口数据格式不兼容：\(error.localizedDescription)")
         }
         guard account.success, account.hasQuotaData else {
-            throw UsageServiceError.httpStatus(200, "NewAPI 账户余额接口：\(account.message)")
+            throw UsageServiceError.httpStatus(
+                200,
+                "NewAPI 账户余额接口：\(limitedResponseMessage(account.message) ?? "请求失败")"
+            )
         }
         return AccountBalance(
-            value: max(account.quota - account.usedQuota, 0),
+            value: max(saturatingSubtractDouble(account.quota, account.usedQuota), 0),
             rawValue: nil,
             label: "剩余额度",
             unit: .quota
@@ -416,7 +553,10 @@ final class NewAPIUsageProvider: UsageProvider {
             throw UsageServiceError.decoding("NewAPI 统计接口数据格式不兼容：\(error.localizedDescription)")
         }
         guard payload.success, let stat = payload.data else {
-            throw UsageServiceError.httpStatus(200, "NewAPI 统计接口：\(payload.message)")
+            throw UsageServiceError.httpStatus(
+                200,
+                "NewAPI 统计接口：\(limitedResponseMessage(payload.message) ?? "请求失败")"
+            )
         }
         _ = response
         return stat
@@ -431,9 +571,11 @@ final class NewAPIUsageProvider: UsageProvider {
     ) async throws -> (items: [NewAPILog], total: Int) {
         var allLogs: [NewAPILog] = []
         var total = 0
+        var totalResponseBytes = 0
         let pageSize = 100
         let maxPages = 500
         var page = 1
+        var seenPageFingerprints = Set<String>()
 
         while page <= maxPages {
             let url = try makeURL(
@@ -453,6 +595,10 @@ final class NewAPIUsageProvider: UsageProvider {
                 userID: userID,
                 stage: "日志接口"
             )
+            totalResponseBytes += data.count
+            if totalResponseBytes > maxPaginatedResponseBytes {
+                throw UsageServiceError.responseTooLarge(maxPaginatedResponseBytes)
+            }
             let payload: NewAPILogsResponse
             do {
                 payload = try decoder.decode(NewAPILogsResponse.self, from: data)
@@ -460,10 +606,17 @@ final class NewAPIUsageProvider: UsageProvider {
                 throw UsageServiceError.decoding("NewAPI 日志接口数据格式不兼容：\(error.localizedDescription)")
             }
             guard payload.success, let pageData = payload.data else {
-                throw UsageServiceError.httpStatus(200, "NewAPI 日志接口：\(payload.message)")
+                throw UsageServiceError.httpStatus(
+                    200,
+                    "NewAPI 日志接口：\(limitedResponseMessage(payload.message) ?? "请求失败")"
+                )
             }
 
-            total = pageData.total
+            total = max(pageData.total, 0)
+            let pageFingerprint = pageData.items.map(\.fingerprint).joined(separator: "\n")
+            if !pageData.items.isEmpty, !seenPageFingerprints.insert(pageFingerprint).inserted {
+                throw UsageServiceError.httpStatus(0, "NewAPI 日志分页没有继续推进，请缩小查询范围")
+            }
             allLogs.append(contentsOf: pageData.items)
             // Some NewAPI builds report total=0 while still returning rows.
             // Only use total as an early-stop condition when it is positive.
@@ -476,7 +629,7 @@ final class NewAPIUsageProvider: UsageProvider {
         if page > maxPages {
             throw UsageServiceError.httpStatus(
                 0,
-                "NewAPI 日志数量超过安全读取上限（(maxPages * pageSize) 条），请缩小查询范围"
+                "NewAPI 日志数量超过安全读取上限（\(maxPages * pageSize) 条），请缩小查询范围"
             )
         }
         return (allLogs, total)
@@ -497,7 +650,7 @@ final class NewAPIUsageProvider: UsageProvider {
         request.setValue("application/json", forHTTPHeaderField: "Accept")
 
         do {
-            let (data, response) = try await session.data(for: request)
+            let (data, response) = try await boundedData(for: request, using: session)
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw UsageServiceError.httpStatus(0, "NewAPI \(stage)（\(url.path)）：服务返回了无效响应")
             }
@@ -510,6 +663,10 @@ final class NewAPIUsageProvider: UsageProvider {
             return (data, httpResponse)
         } catch let error as UsageServiceError {
             throw error
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
         } catch {
             throw UsageServiceError.httpStatus(0, "NewAPI \(stage)（\(url.path)）：\(networkMessage(for: error))")
         }
@@ -532,12 +689,11 @@ final class NewAPIUsageProvider: UsageProvider {
         }
 
         guard let payload = try? decoder.decode(ErrorPayload.self, from: data) else {
-            let body = String(data: data, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return body?.isEmpty == false ? body : nil
+            let body = String(data: data, encoding: .utf8)
+            return limitedResponseMessage(body)
         }
         let message = payload.message ?? payload.error ?? payload.code
-        return message?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? message : nil
+        return limitedResponseMessage(message)
     }
 
     private func dateKey(for timestamp: TimeInterval, calendar: Calendar) -> String {
@@ -594,6 +750,57 @@ private final class ProcessTimeoutState {
     }
 }
 
+private final class OfficialProcessController: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var outputHandle: FileHandle?
+    private var cancellationRequested = false
+    private var finished = false
+
+    func register(process: Process, outputHandle: FileHandle) {
+        lock.lock()
+        self.process = process
+        self.outputHandle = outputHandle
+        let shouldCancel = cancellationRequested || finished
+        lock.unlock()
+        if shouldCancel {
+            terminate(process: process, outputHandle: outputHandle)
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancellationRequested = true
+        let process = self.process
+        let outputHandle = self.outputHandle
+        lock.unlock()
+        if let process {
+            terminate(process: process, outputHandle: outputHandle)
+        }
+    }
+
+    func finish() {
+        lock.lock()
+        finished = true
+        process = nil
+        outputHandle = nil
+        lock.unlock()
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationRequested
+    }
+
+    private func terminate(process: Process, outputHandle: FileHandle?) {
+        if process.isRunning {
+            process.terminate()
+        }
+        outputHandle?.closeFile()
+    }
+}
+
 final class OfficialCodexUsageProvider: UsageProvider {
     let displayName = "官方 Codex"
 
@@ -601,32 +808,34 @@ final class OfficialCodexUsageProvider: UsageProvider {
         guard configuration.provider == .officialCodex else {
             throw UsageServiceError.invalidConfiguration("官方 Codex 配置不完整")
         }
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async {
-                do {
-                    continuation.resume(returning: try Self.fetchSynchronously())
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
+        return try await fetchFromAppServer()
     }
 
     func fetchAccountBalance(configuration: ProviderConfiguration) async throws -> AccountBalance? {
         guard configuration.provider == .officialCodex else { return nil }
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async {
-                do {
-                    continuation.resume(returning: try Self.fetchSynchronously().accountBalance)
-                } catch {
-                    continuation.resume(throwing: error)
-                }
-            }
-        }
+        return try await fetchFromAppServer().accountBalance
     }
 
-    private static func fetchSynchronously() throws -> UsageSnapshot {
+    private func fetchFromAppServer() async throws -> UsageSnapshot {
+        let controller = OfficialProcessController()
+        return try await withTaskCancellationHandler(operation: {
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .utility).async {
+                    do {
+                        continuation.resume(returning: try Self.fetchSynchronously(controller: controller))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+        }, onCancel: {
+            controller.cancel()
+        })
+    }
+
+    private static func fetchSynchronously(controller: OfficialProcessController) throws -> UsageSnapshot {
         let executable = try findCodexExecutable()
+        guard !controller.isCancelled else { throw CancellationError() }
         let process = Process()
         let input = Pipe()
         let output = Pipe()
@@ -642,6 +851,7 @@ final class OfficialCodexUsageProvider: UsageProvider {
             throw UsageServiceError.httpStatus(0, "无法启动 Codex app-server：\(error.localizedDescription)")
         }
         let outputHandle = output.fileHandleForReading
+        controller.register(process: process, outputHandle: outputHandle)
         let timeoutState = ProcessTimeoutState()
         let timeoutWork = DispatchWorkItem {
             guard timeoutState.markTimedOut() else { return }
@@ -658,31 +868,49 @@ final class OfficialCodexUsageProvider: UsageProvider {
         defer {
             timeoutState.markFinished()
             timeoutWork.cancel()
+            controller.finish()
             input.fileHandleForWriting.closeFile()
             outputHandle.closeFile()
             Self.stop(process)
         }
 
-        try write(["method": "initialize", "id": 1, "params": [
-            "clientInfo": [
-                "name": "codex_usage_menubar",
-                "title": "Codex Usage Menu Bar",
-                "version": "0.1.0"
-            ]
-        ]], to: input.fileHandleForWriting)
-        try write(["method": "initialized"], to: input.fileHandleForWriting)
-        try write(["method": "account/rateLimits/read", "id": 2], to: input.fileHandleForWriting)
-        try write(["method": "account/usage/read", "id": 3], to: input.fileHandleForWriting)
+        guard !controller.isCancelled else { throw CancellationError() }
+        do {
+            try write(["method": "initialize", "id": 1, "params": [
+                "clientInfo": [
+                    "name": "codex_usage_menubar",
+                    "title": "Codex Usage Menu Bar",
+                    "version": "0.1.0"
+                ]
+            ]], to: input.fileHandleForWriting)
+            try write(["method": "initialized"], to: input.fileHandleForWriting)
+            try write(["method": "account/rateLimits/read", "id": 2], to: input.fileHandleForWriting)
+            try write(["method": "account/usage/read", "id": 3], to: input.fileHandleForWriting)
+        } catch {
+            if controller.isCancelled { throw CancellationError() }
+            throw error
+        }
 
         var responses: [Int: [String: Any]] = [:]
         var pending = Data()
+        var totalOutputBytes = 0
         while responses[2] == nil || responses[3] == nil {
             do {
                 guard let chunk = try outputHandle.read(upToCount: 4_096), !chunk.isEmpty else {
                     break
                 }
                 pending.append(chunk)
+                totalOutputBytes += chunk.count
+                guard totalOutputBytes <= maxProcessOutputBytes else {
+                    throw UsageServiceError.responseTooLarge(maxProcessOutputBytes)
+                }
+                guard pending.count <= maxProcessLineBytes else {
+                    throw UsageServiceError.responseTooLarge(maxProcessLineBytes)
+                }
             } catch {
+                if controller.isCancelled {
+                    throw CancellationError()
+                }
                 if timeoutState.didTimeOut {
                     throw UsageServiceError.httpStatus(0, "官方 Codex 请求超时")
                 }
@@ -695,6 +923,7 @@ final class OfficialCodexUsageProvider: UsageProvider {
                       let id = (object["id"] as? NSNumber)?.intValue else {
                     continue
                 }
+                guard [1, 2, 3].contains(id) else { continue }
                 responses[id] = object
             }
         }
@@ -751,7 +980,7 @@ final class OfficialCodexUsageProvider: UsageProvider {
 
     private static func rpcError(in response: [String: Any]?) -> String? {
         guard let error = response?["error"] as? [String: Any] else { return nil }
-        return error["message"] as? String ?? "Codex app-server 请求失败"
+        return limitedResponseMessage(error["message"] as? String) ?? "Codex app-server 请求失败"
     }
 
     private static func makeSnapshot(rateResult: [String: Any], usageResult: [String: Any]) -> UsageSnapshot {
@@ -795,9 +1024,11 @@ final class OfficialCodexUsageProvider: UsageProvider {
         let creditsUnlimited = credits?["unlimited"] as? Bool ?? false
         let accountBalance: AccountBalance? = if creditsUnlimited {
             AccountBalance(value: nil, rawValue: "无限", label: "Credits", unit: .credits)
-        } else if let creditsBalance {
+        } else if let creditsBalance,
+                  let balanceValue = Double(creditsBalance),
+                  balanceValue.isFinite {
             AccountBalance(
-                value: Double(creditsBalance),
+                value: balanceValue,
                 rawValue: creditsBalance,
                 label: "Credits",
                 unit: .credits
@@ -842,14 +1073,24 @@ final class OfficialCodexUsageProvider: UsageProvider {
     }
 
     private static func doubleValue(_ value: Any?) -> Double {
-        if let number = value as? NSNumber { return number.doubleValue }
-        if let string = value as? String, let number = Double(string) { return number }
+        if let number = value as? NSNumber, number.doubleValue.isFinite {
+            return min(max(number.doubleValue, 0), 100)
+        }
+        if let string = value as? String, let number = Double(string), number.isFinite {
+            return min(max(number, 0), 100)
+        }
         return 0
     }
 
     private static func intValue(_ value: Any?) -> Int {
-        if let number = value as? NSNumber { return number.intValue }
-        if let string = value as? String, let number = Double(string) { return Int(number) }
+        if let number = value as? NSNumber, let integer = safeInteger(from: number.doubleValue) {
+            return max(integer, 0)
+        }
+        if let string = value as? String,
+           let number = Double(string),
+           let integer = safeInteger(from: number) {
+            return max(integer, 0)
+        }
         return 0
     }
 
@@ -861,10 +1102,12 @@ final class OfficialCodexUsageProvider: UsageProvider {
     private static func dateValue(_ value: Any?) -> Date? {
         if let number = value as? NSNumber {
             let timestamp = number.doubleValue
+            guard timestamp.isFinite else { return nil }
             return Date(timeIntervalSince1970: timestamp > 100_000_000_000 ? timestamp / 1_000 : timestamp)
         }
         if let string = value as? String {
             if let timestamp = Double(string) {
+                guard timestamp.isFinite else { return nil }
                 return Date(timeIntervalSince1970: timestamp > 100_000_000_000 ? timestamp / 1_000 : timestamp)
             }
             return ISO8601DateFormatter().date(from: string)

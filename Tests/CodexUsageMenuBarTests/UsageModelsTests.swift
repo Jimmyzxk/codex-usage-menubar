@@ -94,7 +94,7 @@ final class UsageModelsTests: XCTestCase {
         XCTAssertEqual(response.models.first?.model, "gpt-5.2-codex")
         XCTAssertEqual(response.models.first?.totalTokens, 30)
         XCTAssertEqual(response.models.first?.cacheReadTokens, 6)
-        XCTAssertEqual(response.models.first?.actualCost, 0.12, accuracy: 0.0001)
+        XCTAssertEqual(response.models.first?.actualCost ?? -1, 0.12, accuracy: 0.0001)
 
         let usage = ModelUsage(
             id: response.models[0].model,
@@ -167,6 +167,90 @@ final class UsageModelsTests: XCTestCase {
         )
 
         XCTAssertTrue(selectTodayModelUsage(primary: [cumulative], fallback: nil, today: today).isEmpty)
+    }
+
+    func testUsageHistoryStoreDeduplicatesHourlySamplesAndKeepsDailyData() throws {
+        let suiteName = "com.codexusage.history-tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        let store = UsageHistoryStore(defaults: defaults)
+        let profile = ProviderProfile(
+            id: "history-profile",
+            name: "测试供应商",
+            provider: .sub2api,
+            baseURL: "https://example.com"
+        )
+        let now = try XCTUnwrap(Calendar.current.dateInterval(of: .hour, for: Date())?.start.addingTimeInterval(60))
+        let dateComponents = Calendar.current.dateComponents([.year, .month, .day], from: now)
+        let todayKey = String(format: "%04d-%02d-%02d", dateComponents.year!, dateComponents.month!, dateComponents.day!)
+        let snapshot = UsageSnapshot(
+            providerName: "Sub2API",
+            today: UsageBucket(
+                requests: 2,
+                inputTokens: 100,
+                outputTokens: 200,
+                cacheCreationTokens: 0,
+                cacheReadTokens: 0,
+                totalTokens: 300,
+                actualCost: 0.2,
+                standardCost: 0.2
+            ),
+            dailyUsage: [DailyUsage(
+                date: todayKey,
+                requests: 2,
+                inputTokens: 100,
+                outputTokens: 200,
+                cacheReadTokens: 0,
+                cacheWriteTokens: 0,
+                totalTokens: 300,
+                actualCost: 0.2
+            )],
+            averageDurationMs: 100,
+            rpm: 1,
+            tpm: 2,
+            billingMode: .currency,
+            modelUsage: [],
+            official: nil,
+            accountBalance: nil,
+            fetchedAt: now
+        )
+
+        store.record(snapshot: snapshot, profile: profile, at: now)
+        XCTAssertEqual(store.entries(for: profile.id).count, 2)
+
+        let updated = UsageSnapshot(
+            providerName: snapshot.providerName,
+            today: UsageBucket(
+                requests: 3,
+                inputTokens: 150,
+                outputTokens: 250,
+                cacheCreationTokens: 0,
+                cacheReadTokens: 0,
+                totalTokens: 400,
+                actualCost: 0.3,
+                standardCost: 0.3
+            ),
+            dailyUsage: snapshot.dailyUsage,
+            averageDurationMs: snapshot.averageDurationMs,
+            rpm: snapshot.rpm,
+            tpm: snapshot.tpm,
+            billingMode: snapshot.billingMode,
+            modelUsage: snapshot.modelUsage,
+            official: snapshot.official,
+            accountBalance: snapshot.accountBalance,
+            fetchedAt: now
+        )
+        store.record(snapshot: updated, profile: profile, at: now.addingTimeInterval(300))
+        let hourlyEntry = try XCTUnwrap(store.entries(for: profile.id).first(where: { $0.id.contains("|hour|") }))
+        XCTAssertEqual(store.entries(for: profile.id).count, 2)
+        XCTAssertEqual(hourlyEntry.totalTokens, 400)
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
+    func testProviderCapabilitiesReflectOfficialDataLimits() {
+        XCTAssertTrue(ProviderKind.sub2api.capabilities.supportsModels)
+        XCTAssertTrue(ProviderKind.newAPI.capabilities.supportsBalance)
+        XCTAssertFalse(ProviderKind.officialCodex.capabilities.supportsModels)
+        XCTAssertTrue(ProviderKind.officialCodex.capabilities.supportsQuotaWindows)
     }
 
     func testModelDescriptorSupportsCommonProviderVersions() {

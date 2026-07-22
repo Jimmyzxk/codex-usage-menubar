@@ -23,10 +23,17 @@ DIST_DIR="$ROOT_DIR/dist"
 APP_DIR="$DIST_DIR/CodexUsageMenuBar-$VERSION-$ARCH.app"
 ZIP_PATH="$DIST_DIR/CodexUsageMenuBar-$VERSION-$ARCH.zip"
 DMG_PATH="$DIST_DIR/CodexUsageMenuBar-$VERSION-$ARCH.dmg"
-CHECKSUM_PATH="$DIST_DIR/SHA256SUMS-$ARCH"
+CHECKSUM_PATH="$DIST_DIR/SHA256SUMS-$VERSION-$ARCH"
 SCRATCH_PATH="$ROOT_DIR/.build/github-$ARCH"
+SIGNING_IDENTITY="${CODEX_SIGNING_IDENTITY:--}"
+NOTARY_PROFILE="${CODEX_NOTARY_PROFILE:-}"
 DMG_STAGE_DIR="$(mktemp -d /tmp/codex-usage-dmg.XXXXXX)"
 trap 'rm -rf "$DMG_STAGE_DIR"' EXIT
+
+if [[ -n "$NOTARY_PROFILE" && "$SIGNING_IDENTITY" == "-" ]]; then
+    print -u2 "启用公证时必须提供 CODEX_SIGNING_IDENTITY（Developer ID Application）"
+    exit 2
+fi
 
 rm -rf "$APP_DIR" "$ZIP_PATH" "$DMG_PATH" "$CHECKSUM_PATH"
 mkdir -p "$DIST_DIR"
@@ -35,9 +42,21 @@ CODEX_BUILD_ARCH="$ARCH" \
 CODEX_APP_DIR="$APP_DIR" \
 CODEX_SCRATCH_PATH="$SCRATCH_PATH" \
 CODEX_VERSION="$VERSION" \
+CODEX_SIGNING_IDENTITY="$SIGNING_IDENTITY" \
 "$ROOT_DIR/build_app.sh"
 
 ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP_PATH"
+
+if [[ -n "$NOTARY_PROFILE" ]]; then
+    xcrun notarytool submit "$ZIP_PATH" \
+        --keychain-profile "$NOTARY_PROFILE" \
+        --wait
+    xcrun stapler staple "$APP_DIR" >/dev/null
+    xcrun stapler validate "$APP_DIR" >/dev/null
+    # Recreate the zip so it contains the stapled app as well.
+    ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP_PATH"
+fi
+
 ditto "$APP_DIR" "$DMG_STAGE_DIR/$(basename "$APP_DIR")"
 ln -s /Applications "$DMG_STAGE_DIR/Applications"
 hdiutil create \
@@ -46,6 +65,14 @@ hdiutil create \
     -ov \
     -format UDZO \
     "$DMG_PATH" >/dev/null
+
+if [[ -n "$NOTARY_PROFILE" ]]; then
+    xcrun notarytool submit "$DMG_PATH" \
+        --keychain-profile "$NOTARY_PROFILE" \
+        --wait
+    xcrun stapler staple "$DMG_PATH" >/dev/null
+    xcrun stapler validate "$DMG_PATH" >/dev/null
+fi
 (
     cd "$DIST_DIR"
     shasum -a 256 \

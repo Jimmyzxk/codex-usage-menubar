@@ -73,6 +73,106 @@ final class SettingsStore {
     }
 }
 
+struct UsageHistoryEntry: Codable, Equatable, Identifiable {
+    let id: String
+    let profileID: String
+    let profileName: String
+    let provider: String
+    let dateKey: String
+    let capturedAt: Date
+    let requests: Int
+    let inputTokens: Int
+    let outputTokens: Int
+    let totalTokens: Int
+    let charge: Double
+    let balance: Double?
+}
+
+final class UsageHistoryStore {
+    private let defaults: UserDefaults
+    private let key = "usageHistory.v1"
+    private let retention: TimeInterval = 90 * 86_400
+    private let maxEntries = 2_000
+    private var cachedEntries: [UsageHistoryEntry]?
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func entries(for profileID: String) -> [UsageHistoryEntry] {
+        load()
+            .filter { $0.profileID == profileID }
+            .sorted { $0.capturedAt < $1.capturedAt }
+    }
+
+    func record(snapshot: UsageSnapshot, profile: ProviderProfile, at date: Date = Date()) {
+        let hour = floor(date.timeIntervalSince1970 / 3_600) * 3_600
+        let bucketDate = Date(timeIntervalSince1970: hour)
+        let components = Calendar.current.dateComponents([.year, .month, .day], from: bucketDate)
+        let dateKey = String(format: "%04d-%02d-%02d", components.year ?? 0, components.month ?? 0, components.day ?? 0)
+        var entries = load().filter { $0.capturedAt >= date.addingTimeInterval(-retention) }
+        let currentEntry = UsageHistoryEntry(
+            id: "\(profile.id)|hour|\(Int(hour))",
+            profileID: profile.id,
+            profileName: profile.displayName,
+            provider: profile.provider.rawValue,
+            dateKey: dateKey,
+            capturedAt: date,
+            requests: snapshot.today.requests,
+            inputTokens: snapshot.today.inputTokens,
+            outputTokens: snapshot.today.outputTokens,
+            totalTokens: snapshot.today.totalTokens,
+            charge: snapshot.today.actualCost,
+            balance: snapshot.accountBalance?.value
+        )
+        let dailyEntries = snapshot.dailyUsage.map { item in
+            UsageHistoryEntry(
+                id: "\(profile.id)|day|\(item.date)",
+                profileID: profile.id,
+                profileName: profile.displayName,
+                provider: profile.provider.rawValue,
+                dateKey: item.date,
+                capturedAt: date,
+                requests: item.requests,
+                inputTokens: item.inputTokens,
+                outputTokens: item.outputTokens,
+                totalTokens: item.totalTokens,
+                charge: item.actualCost,
+                balance: item.date == dateKey ? snapshot.accountBalance?.value : nil
+            )
+        }
+        for entry in [currentEntry] + dailyEntries {
+            if let index = entries.firstIndex(where: { $0.id == entry.id }) {
+                entries[index] = entry
+            } else {
+                entries.append(entry)
+            }
+        }
+        entries.sort { $0.capturedAt < $1.capturedAt }
+        if entries.count > maxEntries {
+            entries = Array(entries.suffix(maxEntries))
+        }
+        save(entries)
+    }
+
+    private func load() -> [UsageHistoryEntry] {
+        if let cachedEntries { return cachedEntries }
+        guard let data = defaults.data(forKey: key),
+              let entries = try? JSONDecoder().decode([UsageHistoryEntry].self, from: data) else {
+            cachedEntries = []
+            return []
+        }
+        cachedEntries = entries
+        return entries
+    }
+
+    private func save(_ entries: [UsageHistoryEntry]) {
+        cachedEntries = entries
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        defaults.set(data, forKey: key)
+    }
+}
+
 final class KeychainStore {
     // Use a fresh item name so old ad-hoc-signed entries are never queried on
     // launch. The read query also explicitly forbids UI authentication.
@@ -86,29 +186,46 @@ final class KeychainStore {
 
     func readAPIKey(for profileID: String, includeLegacy: Bool = false) throws -> String? {
         let account = account(for: profileID)
-        // Do not query legacy services on launch. Older entries may carry an
-        // ACL that macOS turns into a password sheet before the app can fail.
-        _ = includeLegacy
-        return try readValue(service: service, account: account)
+        if let value = try readValue(service: service, account: account, allowAuthentication: false) {
+            return value
+        }
+        guard includeLegacy else { return nil }
+
+        // Legacy entries are checked only after an explicit user action (for
+        // example opening a profile in Settings), never during app startup.
+        if let value = try readValue(service: legacyService, account: account, allowAuthentication: true) {
+            migrateLegacyValue(value, account: account)
+            return value
+        }
+        if profileID == "legacy-sub2api", account != legacyAccount {
+            if let value = try readValue(service: legacyService, account: legacyAccount, allowAuthentication: true) {
+                migrateLegacyValue(value, account: legacyAccount)
+                return value
+            }
+        }
+        return nil
     }
 
-    private func readValue(service: String, account: String) throws -> String? {
-        let authenticationContext = LAContext()
-        authenticationContext.interactionNotAllowed = true
+    private func readValue(service: String, account: String, allowAuthentication: Bool) throws -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
             kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-            // Keep the literal value for the deprecated constant so older
-            // ACL-protected items cannot open a system authentication sheet.
-            kSecUseAuthenticationUI as String: "fail",
-            kSecUseAuthenticationContext as String: authenticationContext
+            kSecMatchLimit as String: kSecMatchLimitOne
         ]
+        var authenticatedQuery = query
+        if !allowAuthentication {
+            let authenticationContext = LAContext()
+            authenticationContext.interactionNotAllowed = true
+            // Keep the literal value for the deprecated constant so old
+            // ACL-protected items cannot open a system authentication sheet.
+            authenticatedQuery[kSecUseAuthenticationUI as String] = "fail"
+            authenticatedQuery[kSecUseAuthenticationContext as String] = authenticationContext
+        }
 
         var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        let status = SecItemCopyMatching(authenticatedQuery as CFDictionary, &result)
         if status == errSecItemNotFound {
             return nil
         }
@@ -127,8 +244,16 @@ final class KeychainStore {
     func saveAPIKey(_ apiKey: String, for profileID: String) throws {
         let account = account(for: profileID)
         try saveValue(apiKey, service: service, account: account)
-        // Do not leave a second copy behind after a successful migration.
-        try? deleteValue(service: legacyService, account: account)
+        // The v4 item is already the source of truth. Cleanup of an old ACL
+        // protected item must not make a successful save look like a failure.
+        try? deleteValue(service: legacyService, account: account, allowAuthentication: false)
+    }
+
+    private func migrateLegacyValue(_ value: String, account: String) {
+        guard (try? saveValue(value, service: service, account: account)) != nil else { return }
+        // A failed cleanup is harmless on the next launch because the v4 item
+        // is read first and legacy reads remain limited to explicit settings.
+        try? deleteValue(service: legacyService, account: account, allowAuthentication: false)
     }
 
     private func saveValue(_ value: String, service: String, account: String) throws {
@@ -163,21 +288,28 @@ final class KeychainStore {
 
     func deleteAPIKey(for profileID: String, includeLegacy: Bool = false) throws {
         let account = account(for: profileID)
-        try deleteValue(service: service, account: account)
-        try deleteValue(service: legacyService, account: account)
+        try deleteValue(service: service, account: account, allowAuthentication: true)
+        try deleteValue(service: legacyService, account: account, allowAuthentication: true)
         if includeLegacy, account != legacyAccount {
-            try deleteValue(service: service, account: legacyAccount)
-            try deleteValue(service: legacyService, account: legacyAccount)
+            try deleteValue(service: service, account: legacyAccount, allowAuthentication: true)
+            try deleteValue(service: legacyService, account: legacyAccount, allowAuthentication: true)
         }
     }
 
-    private func deleteValue(service: String, account: String) throws {
+    private func deleteValue(service: String, account: String, allowAuthentication: Bool) throws {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        let status = SecItemDelete(query as CFDictionary)
+        var authenticatedQuery = query
+        if !allowAuthentication {
+            let authenticationContext = LAContext()
+            authenticationContext.interactionNotAllowed = true
+            authenticatedQuery[kSecUseAuthenticationUI as String] = "fail"
+            authenticatedQuery[kSecUseAuthenticationContext as String] = authenticationContext
+        }
+        let status = SecItemDelete(authenticatedQuery as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw UsageServiceError.keychain(status)
         }
